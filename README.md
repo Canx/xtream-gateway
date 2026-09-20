@@ -154,7 +154,7 @@ Each entry represents a routing profile:
 
 ## Production Deployment (Nginx Reverse Proxy & TLS)
 
-For encrypted end-to-end streaming over TLS 1.3 / HTTP/2 with a valid Let's Encrypt certificate, place the gateway behind Nginx:
+For encrypted end-to-end streaming over TLS 1.3 / HTTP/2 with a valid SSL/TLS certificate, place the gateway behind a reverse proxy such as Nginx:
 
 ```nginx
 server {
@@ -167,8 +167,8 @@ server {
     listen 443 ssl http2;
     server_name stream.yourdomain.com;
 
-    ssl_certificate /etc/letsencrypt/live/stream.yourdomain.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/stream.yourdomain.com/privkey.pem;
+    ssl_certificate /path/to/ssl/fullchain.pem;
+    ssl_certificate_key /path/to/ssl/privkey.pem;
 
     location / {
         proxy_pass http://127.0.0.1:8888;
