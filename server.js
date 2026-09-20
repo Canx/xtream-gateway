@@ -287,6 +287,7 @@ function handleRequest(req, res, postBody) {
       'Accept': req.headers['accept'] || '*/*',
     };
     if (req.headers['range']) fwdHeaders['Range'] = req.headers['range'];
+    if (req.headers['if-range']) fwdHeaders['If-Range'] = req.headers['if-range'];
 
     const upstreamReq = http.request(targetStreamUrl, {
       method: req.method,
@@ -297,10 +298,11 @@ function handleRequest(req, res, postBody) {
         const locationUrl = new URL(upstreamRes.headers.location);
         const cdnHost = locationUrl.host;
         const cdnToken = getCdnToken(cdnHost);
+        const cdnClient = locationUrl.protocol === 'https:' ? https : http;
 
         // HLS playlist: rewrite relative chunks to HMAC signed /cdn/<token>/<cdnHost>/...
         if (reqUrl.includes('.m3u8')) {
-          http.get(locationUrl.href, {
+          cdnClient.get(locationUrl.href, {
             headers: { 'User-Agent': getFwdUserAgent(req) }
           }, (cdnRes) => {
             const chunks = [];
@@ -325,8 +327,9 @@ function handleRequest(req, res, postBody) {
         // Direct MPEG-TS / MP4 binary stream
         const cdnHeaders = { 'User-Agent': getFwdUserAgent(req) };
         if (req.headers['range']) cdnHeaders['Range'] = req.headers['range'];
+        if (req.headers['if-range']) cdnHeaders['If-Range'] = req.headers['if-range'];
 
-        http.get(locationUrl.href, { headers: cdnHeaders }, (cdnRes) => {
+        cdnClient.get(locationUrl.href, { headers: cdnHeaders }, (cdnRes) => {
           setCorsHeaders(res);
           const outHeaders = { ...cdnRes.headers };
           delete outHeaders['transfer-encoding'];
