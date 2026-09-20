@@ -66,7 +66,7 @@ flowchart LR
 
 ### 1. Clone the repository
 ```bash
-git clone https://github.com/your-username/xtream-gateway.git
+git clone https://github.com/Canx/xtream-gateway.git
 cd xtream-gateway
 ```
 
