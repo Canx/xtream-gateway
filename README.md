@@ -190,7 +190,7 @@ server {
 ```
 
 > [!TIP]
-> **VOD Seeking & Cloudflare Notice:** If you manage your domain via Cloudflare DNS, configure your streaming subdomain as **DNS Only (Grey Cloud)**. Cloudflare's CDN edge buffers or strips HTTP `Range` requests on large media files (>512 MB), which converts partial byte requests into full downloads (`HTTP 200` instead of `HTTP 206 Partial Content`) and prevents timeline seeking/scrubbing in video players. Setting the DNS record to Grey Cloud delivers direct end-to-end TLS with Nginx and instant seeking.
+> **VOD Seeking & Direct DNS:** Point your streaming domain or subdomain directly to your server using standard DNS (A/AAAA records). Avoid placing caching CDNs or edge proxies in front of the media endpoints, as they often buffer or normalize HTTP `Range` requests on large video files (>512 MB), which can degrade `HTTP 206 Partial Content` slices into full downloads (`HTTP 200`) and disrupt timeline scrubbing in video players. Direct communication with Nginx ensures zero-buffering byte-range delivery.
 
 ---
 
