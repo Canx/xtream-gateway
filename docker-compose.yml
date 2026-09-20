@@ -1,0 +1,15 @@
+services:
+  xtream-gateway:
+    build: .
+    container_name: xtream-gateway
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8888}:8888"
+    environment:
+      - PORT=8888
+      - PROXY_HOST=${PROXY_HOST:-}
+      - CDN_SECRET=${CDN_SECRET:-replace_me_with_a_random_salt_in_production}
+      - PROVIDERS_FILE=/app/providers.json
+    volumes:
+      - ./providers.json:/app/providers.json:ro
+    mem_limit: 256m

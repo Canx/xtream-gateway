@@ -1,0 +1,33 @@
+[
+  {
+    "id": "living-room",
+    "name": "Living Room TV",
+    "clientUser": "living_room",
+    "clientPass": "secure_pass_1",
+    "upstream": {
+      "url": "http://provider1.example.com",
+      "user": "upstream_user_abc123",
+      "pass": "upstream_pass_xyz789"
+    }
+  },
+  {
+    "id": "bedroom",
+    "name": "Bedroom TV Box",
+    "clientUser": "bedroom",
+    "clientPass": "secure_pass_2",
+    "upstream": {
+      "url": "http://provider2.example.com:8080",
+      "user": "upstream_user_def456",
+      "pass": "upstream_pass_uvw321"
+    }
+  },
+  {
+    "id": "direct-example",
+    "name": "Direct Upstream Pass-through (Optional)",
+    "upstream": {
+      "url": "http://provider3.example.com",
+      "user": "direct_user_999",
+      "pass": "direct_pass_999"
+    }
+  }
+]
