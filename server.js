@@ -12,22 +12,27 @@ const { URL, URLSearchParams } = require('url');
 const { pipeline } = require('stream');
 
 const PROXY_PORT = parseInt(process.env.PORT || '8888', 10);
-const DEFAULT_HOST = process.env.PROXY_HOST || '';
+const DEFAULT_HOST = process.env.PROXY_HOST || 'viveentucoche.com';
 const CDN_SECRET = process.env.CDN_SECRET || 'xtream_gateway_default_salt_2026';
-const PROVIDERS_FILE = process.env.PROVIDERS_FILE || path.join(__dirname, 'providers.json');
+function getProvidersFilePath() {
+  return process.env.PROVIDERS_FILE || path.join(__dirname, 'providers.json');
+}
 
 // --- Provider Management & Live Hot-Reload ---
 let cachedProviders = [];
 let lastMtime = 0;
+let lastFilePath = '';
 
 function getProviders() {
+  const filePath = getProvidersFilePath();
   try {
-    if (fs.existsSync(PROVIDERS_FILE)) {
-      const stat = fs.statSync(PROVIDERS_FILE);
-      if (stat.mtimeMs !== lastMtime) {
-        const raw = fs.readFileSync(PROVIDERS_FILE, 'utf8');
+    if (fs.existsSync(filePath)) {
+      const stat = fs.statSync(filePath);
+      if (stat.mtimeMs !== lastMtime || filePath !== lastFilePath) {
+        const raw = fs.readFileSync(filePath, 'utf8');
         cachedProviders = JSON.parse(raw);
         lastMtime = stat.mtimeMs;
+        lastFilePath = filePath;
         console.log(`[CONFIG] Loaded ${cachedProviders.length} profile(s): ${cachedProviders.map(p => p.id || p.name).join(', ')}`);
       }
     }
@@ -99,14 +104,15 @@ function getFwdUserAgent(req) {
   return ua;
 }
 
-function extractCredentials(reqUrl, postBody) {
+function extractCredentials(req, postBody) {
   let user = null;
   let pass = null;
+  const reqUrl = (req && req.url) || (typeof req === 'string' ? req : '');
 
   try {
     const parsed = new URL(reqUrl, 'http://localhost');
-    user = parsed.searchParams.get('username');
-    pass = parsed.searchParams.get('password');
+    user = parsed.searchParams.get('username') || parsed.searchParams.get('user');
+    pass = parsed.searchParams.get('password') || parsed.searchParams.get('pass');
   } catch (_) {}
 
   if (!user || !pass) {
@@ -117,22 +123,89 @@ function extractCredentials(reqUrl, postBody) {
     }
   }
 
+  if ((!user || !pass) && req && req.headers && req.headers['authorization']) {
+    const authHeader = req.headers['authorization'];
+    if (authHeader.startsWith('Basic ')) {
+      try {
+        const decoded = Buffer.from(authHeader.slice(6), 'base64').toString('utf8');
+        const colonIdx = decoded.indexOf(':');
+        if (colonIdx !== -1) {
+          user = decoded.slice(0, colonIdx);
+          pass = decoded.slice(colonIdx + 1);
+        }
+      } catch (_) {}
+    }
+  }
+
   if ((!user || !pass) && postBody) {
     try {
       const params = new URLSearchParams(postBody);
       if (params.has('username')) user = params.get('username');
+      else if (params.has('user')) user = params.get('user');
       if (params.has('password')) pass = params.get('password');
+      else if (params.has('pass')) pass = params.get('pass');
     } catch (_) {}
     if ((!user || !pass) && postBody.startsWith('{')) {
       try {
         const json = JSON.parse(postBody);
         if (json.username) user = json.username;
+        else if (json.user) user = json.user;
         if (json.password) pass = json.password;
+        else if (json.pass) pass = json.pass;
       } catch (_) {}
     }
   }
 
   return { user, pass };
+}
+
+function translateUrlAndBody(targetUrl, postBody, upstreamUser, upstreamPass) {
+  let translatedUrl = targetUrl;
+  let translatedBody = postBody;
+
+  try {
+    const u = new URL(targetUrl, 'http://localhost');
+    let modified = false;
+    for (const key of ['username', 'user']) {
+      if (u.searchParams.has(key)) {
+        u.searchParams.set(key, upstreamUser);
+        modified = true;
+      }
+    }
+    for (const key of ['password', 'pass']) {
+      if (u.searchParams.has(key)) {
+        u.searchParams.set(key, upstreamPass);
+        modified = true;
+      }
+    }
+    if (modified) {
+      translatedUrl = u.pathname + u.search;
+    }
+  } catch (_) {}
+
+  if (translatedBody) {
+    try {
+      const sp = new URLSearchParams(translatedBody);
+      let modified = false;
+      for (const key of ['username', 'user']) {
+        if (sp.has(key)) {
+          sp.set(key, upstreamUser);
+          modified = true;
+        }
+      }
+      for (const key of ['password', 'pass']) {
+        if (sp.has(key)) {
+          sp.set(key, upstreamPass);
+          modified = true;
+        }
+      }
+      if (modified) {
+        translatedBody = sp.toString();
+      }
+    } catch (_) {}
+  }
+
+  return { translatedUrl, translatedBody };
 }
 
 function findProvider(user, pass) {
@@ -261,7 +334,7 @@ function handleRequest(req, res, postBody) {
   }
 
   // 2. Authentication & Provider Resolution
-  const { user, pass } = extractCredentials(reqUrl, postBody);
+  const { user, pass } = extractCredentials(req, postBody);
   const matched = findProvider(user, pass);
 
   if (!matched) {
@@ -289,7 +362,8 @@ function handleRequest(req, res, postBody) {
     if (req.headers['range']) fwdHeaders['Range'] = req.headers['range'];
     if (req.headers['if-range']) fwdHeaders['If-Range'] = req.headers['if-range'];
 
-    const upstreamReq = http.request(targetStreamUrl, {
+    const streamClient = targetStreamUrl.startsWith('https://') ? https : http;
+    const upstreamReq = streamClient.request(targetStreamUrl, {
       method: req.method,
       headers: fwdHeaders,
     }, (upstreamRes) => {
@@ -363,26 +437,9 @@ function handleRequest(req, res, postBody) {
 
   // 4. Xtream Codes Client API (/player_api.php or /panel_api.php)
   if (reqUrl.startsWith('/player_api.php') || reqUrl.startsWith('/panel_api.php')) {
-    let translatedUrl = reqUrl;
-    let translatedBody = postBody;
-
-    if (matchedAs === 'virtual') {
-      try {
-        const u = new URL(reqUrl, 'http://localhost');
-        if (u.searchParams.has('username')) u.searchParams.set('username', upstreamUser);
-        if (u.searchParams.has('password')) u.searchParams.set('password', upstreamPass);
-        translatedUrl = u.pathname + u.search;
-      } catch (_) {}
-
-      if (translatedBody) {
-        try {
-          const sp = new URLSearchParams(translatedBody);
-          if (sp.has('username')) sp.set('username', upstreamUser);
-          if (sp.has('password')) sp.set('password', upstreamPass);
-          translatedBody = sp.toString();
-        } catch (_) {}
-      }
-    }
+    const { translatedUrl, translatedBody } = (matchedAs === 'virtual')
+      ? translateUrlAndBody(reqUrl, postBody, upstreamUser, upstreamPass)
+      : { translatedUrl: reqUrl, translatedBody: postBody };
 
     let parsedUrl;
     try {
@@ -402,7 +459,8 @@ function handleRequest(req, res, postBody) {
       fwdHeaders['Content-Length'] = Buffer.byteLength(translatedBody);
     }
 
-    const upstreamReq = http.request(`${upstreamUrl}${translatedUrl}`, {
+    const apiClient = upstreamUrl.startsWith('https://') ? https : http;
+    const upstreamReq = apiClient.request(`${upstreamUrl}${translatedUrl}`, {
       method: req.method,
       headers: fwdHeaders,
     }, (upstreamRes) => {
@@ -455,17 +513,96 @@ function handleRequest(req, res, postBody) {
     return;
   }
 
-  // 5. Fallback Pass-through (/xmltv.php, icons, etc.)
+  // 5. Fallback Pass-through (/xmltv.php, /epg.php, /get.php, icons, etc.)
+  const { translatedUrl, translatedBody } = (matchedAs === 'virtual')
+    ? translateUrlAndBody(reqUrl, postBody, upstreamUser, upstreamPass)
+    : { translatedUrl: reqUrl, translatedBody: postBody };
+
   let upstreamHost = 'localhost';
   try {
     upstreamHost = new URL(upstreamUrl).host;
   } catch (_) {}
 
-  const fwdHeaders = { ...req.headers, host: upstreamHost, 'User-Agent': getFwdUserAgent(req) };
-  const upstreamReq = http.request(`${upstreamUrl}${reqUrl}`, {
+  const fwdHeaders = { ...req.headers };
+  delete fwdHeaders['host'];
+  fwdHeaders['host'] = upstreamHost;
+  fwdHeaders['user-agent'] = getFwdUserAgent(req);
+
+  if (translatedBody) {
+    fwdHeaders['content-length'] = Buffer.byteLength(translatedBody);
+  }
+
+  const fallbackClient = upstreamUrl.startsWith('https://') ? https : http;
+  const upstreamReq = fallbackClient.request(`${upstreamUrl}${translatedUrl}`, {
     method: req.method,
     headers: fwdHeaders,
   }, (upstreamRes) => {
+    // Transparently follow redirects (e.g. 302 to external CDN or S3)
+    if ([301, 302, 307, 308].includes(upstreamRes.statusCode) && upstreamRes.headers.location) {
+      try {
+        const redirectUrl = new URL(upstreamRes.headers.location, upstreamUrl);
+        const redirectClient = redirectUrl.protocol === 'https:' ? https : http;
+        const redirectHeaders = { ...fwdHeaders };
+        redirectHeaders['host'] = redirectUrl.host;
+
+        const redirectReq = redirectClient.request(redirectUrl.href, {
+          method: req.method === 'POST' ? 'GET' : req.method,
+          headers: redirectHeaders,
+        }, (redirectRes) => {
+          setCorsHeaders(res);
+          const outHeaders = { ...redirectRes.headers };
+          delete outHeaders['transfer-encoding'];
+          res.writeHead(redirectRes.statusCode, outHeaders);
+          pipeline(redirectRes, res, () => {});
+        });
+
+        redirectReq.on('error', (err) => {
+          console.error('[FALLBACK REDIRECT ERROR]', err.message);
+          if (!res.headersSent) res.writeHead(502);
+          res.end('502 Bad Gateway');
+        });
+
+        redirectReq.end();
+        return;
+      } catch (err) {
+        console.error('[REDIRECT PARSE ERROR]', err.message);
+      }
+    }
+
+    // Special handling for M3U playlist generation (/get.php)
+    if (reqUrl.startsWith('/get.php') && upstreamRes.statusCode === 200) {
+      const chunks = [];
+      upstreamRes.on('data', c => chunks.push(c));
+      upstreamRes.on('end', () => {
+        const isHttps = req.headers['x-forwarded-proto'] === 'https';
+        const hostHeader = (req.headers['host'] || '').split(':')[0] || DEFAULT_HOST;
+        const hostUrl = hostHeader || DEFAULT_HOST || '127.0.0.1';
+        const hostPort = isHttps ? '443' : String(PROXY_PORT);
+        const proto = isHttps ? 'https' : 'http';
+        const gatewayOrigin = `${proto}://${hostUrl}${((isHttps && hostPort === '443') || (!isHttps && hostPort === '80')) ? '' : ':' + hostPort}`;
+
+        let body = Buffer.concat(chunks).toString('utf8');
+        const upOrigin = upstreamUrl.replace(/\/+$/, '');
+        if (matchedAs === 'virtual') {
+          const streamRegex = new RegExp(`${upOrigin}(?::\\d+)?/(live|movie|series)/${upstreamUser}/${upstreamPass}/`, 'g');
+          body = body.replace(streamRegex, `${gatewayOrigin}/$1/${clientUser}/${clientPass}/`);
+          const epgRegex = new RegExp(`${upOrigin}(?::\\d+)?/xmltv\\.php\\?[^"'\r\n\s]+`, 'g');
+          body = body.replace(epgRegex, `${gatewayOrigin}/xmltv.php?username=${clientUser}&password=${clientPass}`);
+        } else {
+          body = body.replace(new RegExp(`${upOrigin}(?::\\d+)?`, 'g'), gatewayOrigin);
+        }
+
+        setCorsHeaders(res);
+        res.writeHead(upstreamRes.statusCode, {
+          'Content-Type': upstreamRes.headers['content-type'] || 'audio/x-mpegurl',
+          'Content-Length': Buffer.byteLength(body),
+          'Access-Control-Allow-Origin': '*',
+        });
+        res.end(body);
+      });
+      return;
+    }
+
     setCorsHeaders(res);
     const outHeaders = { ...upstreamRes.headers };
     delete outHeaders['transfer-encoding'];
@@ -479,10 +616,23 @@ function handleRequest(req, res, postBody) {
     res.end('502 Bad Gateway');
   });
 
-  if (postBody) upstreamReq.write(postBody);
+  if (translatedBody) upstreamReq.write(translatedBody);
   upstreamReq.end();
 }
 
-server.listen(PROXY_PORT, '0.0.0.0', () => {
-  console.log(`Xtream Gateway listening on 0.0.0.0:${PROXY_PORT}`);
-});
+if (require.main === module) {
+  server.listen(PROXY_PORT, '0.0.0.0', () => {
+    console.log(`Xtream Gateway listening on 0.0.0.0:${PROXY_PORT}`);
+  });
+}
+
+module.exports = {
+  server,
+  extractCredentials,
+  findProvider,
+  getProviders,
+  translateUrlAndBody,
+  getCdnToken,
+  isPrivateHost,
+  getFwdUserAgent,
+};
