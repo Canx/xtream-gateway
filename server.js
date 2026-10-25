@@ -8,6 +8,7 @@ const https = require('https');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const dns = require('dns');
 const { URL, URLSearchParams } = require('url');
 const { pipeline } = require('stream');
 
@@ -16,6 +17,58 @@ const DEFAULT_HOST = process.env.PROXY_HOST || 'viveentucoche.com';
 const CDN_SECRET = process.env.CDN_SECRET || 'xtream_gateway_default_salt_2026';
 function getProvidersFilePath() {
   return process.env.PROVIDERS_FILE || path.join(__dirname, 'providers.json');
+}
+
+// --- High-Performance Keep-Alive Connection Pools & DNS Cache ---
+const dnsCache = new Map();
+
+function resolveHostCached(hostname, options, cb) {
+  const callback = typeof options === 'function' ? options : cb;
+  const opts = typeof options === 'object' ? options : {};
+
+  if (!hostname || /^(\d{1,3}\.){3}\d{1,3}$/.test(hostname) || hostname.includes(':')) {
+    return dns.lookup(hostname, opts, callback);
+  }
+
+  const now = Date.now();
+  const cached = dnsCache.get(hostname);
+  if (cached && cached.expiresAt > now) {
+    if (opts.all) {
+      return callback(null, [{ address: cached.address, family: cached.family }]);
+    }
+    return callback(null, cached.address, cached.family);
+  }
+
+  dns.lookup(hostname, opts, (err, address, family) => {
+    if (!err && address) {
+      const addr = Array.isArray(address) ? address[0].address : address;
+      const fam = Array.isArray(address) ? address[0].family : family;
+      dnsCache.set(hostname, { address: addr, family: fam, expiresAt: now + 60000 });
+    }
+    callback(err, address, family);
+  });
+}
+
+const httpAgent = new http.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 20000,
+  maxSockets: 300,
+  maxFreeSockets: 64,
+  timeout: 30000,
+  lookup: resolveHostCached,
+});
+
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 20000,
+  maxSockets: 300,
+  maxFreeSockets: 64,
+  timeout: 30000,
+  lookup: resolveHostCached,
+});
+
+function getAgent(urlStr) {
+  return (urlStr && urlStr.startsWith('https:')) ? httpsAgent : httpAgent;
 }
 
 // --- Provider Management & Live Hot-Reload ---
@@ -94,6 +147,46 @@ function setCorsHeaders(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, HEAD');
   res.setHeader('Access-Control-Allow-Headers', '*');
+}
+
+function rewriteM3u8Playlist(body, locationUrl) {
+  const cdnHost = locationUrl.host;
+  const cdnToken = getCdnToken(cdnHost);
+  const lines = body.split(/\r?\n/);
+  const rewritten = lines.map(line => {
+    const trimmed = line.trim();
+    if (!trimmed) return line;
+    if (trimmed.startsWith('#')) {
+      if (trimmed.startsWith('#EXT-X-KEY:') && trimmed.includes('URI="')) {
+        return line.replace(/URI="([^"]+)"/, (m, uri) => {
+          try {
+            const resolved = new URL(uri, locationUrl);
+            const token = getCdnToken(resolved.host);
+            return `URI="/cdn/${token}/${resolved.host}${resolved.pathname}${resolved.search}"`;
+          } catch (_) {
+            return m;
+          }
+        });
+      }
+      return line;
+    }
+    try {
+      if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+        const u = new URL(trimmed);
+        const token = getCdnToken(u.host);
+        return `/cdn/${token}/${u.host}${u.pathname}${u.search}`;
+      } else if (trimmed.startsWith('/')) {
+        return `/cdn/${cdnToken}/${cdnHost}${trimmed}`;
+      } else {
+        const resolved = new URL(trimmed, locationUrl);
+        const token = getCdnToken(resolved.host);
+        return `/cdn/${token}/${resolved.host}${resolved.pathname}${resolved.search}`;
+      }
+    } catch (_) {
+      return line;
+    }
+  });
+  return rewritten.join('\n');
 }
 
 function getFwdUserAgent(req) {
@@ -276,6 +369,21 @@ function handleRequest(req, res, postBody) {
   const reqUrl = req.url || '';
   const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
 
+  // Fast 404 for non-IPTV paths (scanners, old web pages, bots)
+  if (
+    reqUrl.startsWith('/productos') ||
+    reqUrl.startsWith('/producto') ||
+    reqUrl.startsWith('/analisis') ||
+    reqUrl.startsWith('/wp-') ||
+    reqUrl.startsWith('/blog') ||
+    reqUrl.startsWith('/feed') ||
+    reqUrl.startsWith('/sitemap')
+  ) {
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('404 Not Found');
+    return;
+  }
+
   if (isIpBlocked(clientIp)) {
     res.writeHead(403, { 'Content-Type': 'text/plain' });
     res.end('403 Forbidden');
@@ -311,15 +419,51 @@ function handleRequest(req, res, postBody) {
     };
     if (req.headers['range']) fwdHeaders['Range'] = req.headers['range'];
 
-    const upstreamReq = http.request(`http://${targetHost}${targetPath}`, {
+    const targetUrl = `http://${targetHost}${targetPath}`;
+    const client = targetHost.includes(':443') ? https : http;
+
+    const upstreamReq = client.request(targetUrl, {
       method: req.method,
       headers: fwdHeaders,
+      agent: getAgent(targetUrl),
     }, (upstreamRes) => {
+      // Follow 301, 302, 307, 308 redirects from CDN edge if any
+      if ([301, 302, 307, 308].includes(upstreamRes.statusCode) && upstreamRes.headers.location) {
+        try {
+          const redirectUrl = new URL(upstreamRes.headers.location, targetUrl);
+          const redirectClient = redirectUrl.protocol === 'https:' ? https : http;
+          const redirectReq = redirectClient.request(redirectUrl.href, {
+            method: req.method,
+            headers: { ...fwdHeaders, host: redirectUrl.host },
+            agent: getAgent(redirectUrl.href),
+          }, (redirectRes) => {
+            setCorsHeaders(res);
+            const resHeaders = { ...redirectRes.headers };
+            delete resHeaders['transfer-encoding'];
+            res.writeHead(redirectRes.statusCode, resHeaders);
+            pipeline(redirectRes, res, () => {});
+          });
+          redirectReq.on('error', () => {
+            if (!res.headersSent) res.writeHead(502);
+            res.end('502 Bad Gateway');
+          });
+          req.on('close', () => {
+            if (!upstreamRes.complete) redirectReq.destroy();
+          });
+          redirectReq.end();
+          return;
+        } catch (_) {}
+      }
+
       setCorsHeaders(res);
       const resHeaders = { ...upstreamRes.headers };
       delete resHeaders['transfer-encoding'];
       res.writeHead(upstreamRes.statusCode, resHeaders);
       pipeline(upstreamRes, res, () => {});
+    });
+
+    req.on('close', () => {
+      upstreamReq.destroy();
     });
 
     upstreamReq.on('error', (err) => {
@@ -366,24 +510,24 @@ function handleRequest(req, res, postBody) {
     const upstreamReq = streamClient.request(targetStreamUrl, {
       method: req.method,
       headers: fwdHeaders,
+      agent: getAgent(targetStreamUrl),
     }, (upstreamRes) => {
       // Follow 301, 302, 307, 308 redirects to ephemeral CDN servers
       if ([301, 302, 307, 308].includes(upstreamRes.statusCode) && upstreamRes.headers.location) {
         const locationUrl = new URL(upstreamRes.headers.location);
-        const cdnHost = locationUrl.host;
-        const cdnToken = getCdnToken(cdnHost);
         const cdnClient = locationUrl.protocol === 'https:' ? https : http;
 
         // HLS playlist: rewrite relative chunks to HMAC signed /cdn/<token>/<cdnHost>/...
         if (reqUrl.includes('.m3u8')) {
           cdnClient.get(locationUrl.href, {
-            headers: { 'User-Agent': getFwdUserAgent(req) }
+            headers: { 'User-Agent': getFwdUserAgent(req) },
+            agent: getAgent(locationUrl.href),
           }, (cdnRes) => {
             const chunks = [];
             cdnRes.on('data', c => chunks.push(c));
             cdnRes.on('end', () => {
               const body = Buffer.concat(chunks).toString('utf8');
-              const rewritten = body.replace(/(\/hls\/[^\s\r\n]+)/g, (match) => `/cdn/${cdnToken}/${cdnHost}${match}`);
+              const rewritten = rewriteM3u8Playlist(body, locationUrl);
               res.writeHead(cdnRes.statusCode, {
                 'Content-Type': cdnRes.headers['content-type'] || 'application/vnd.apple.mpegurl',
                 'Content-Length': Buffer.byteLength(rewritten),
@@ -403,13 +547,22 @@ function handleRequest(req, res, postBody) {
         if (req.headers['range']) cdnHeaders['Range'] = req.headers['range'];
         if (req.headers['if-range']) cdnHeaders['If-Range'] = req.headers['if-range'];
 
-        cdnClient.get(locationUrl.href, { headers: cdnHeaders }, (cdnRes) => {
+        const cdnStreamReq = cdnClient.get(locationUrl.href, {
+          headers: cdnHeaders,
+          agent: getAgent(locationUrl.href),
+        }, (cdnRes) => {
           setCorsHeaders(res);
           const outHeaders = { ...cdnRes.headers };
           delete outHeaders['transfer-encoding'];
           res.writeHead(cdnRes.statusCode, outHeaders);
           pipeline(cdnRes, res, () => {});
-        }).on('error', (err) => {
+        });
+
+        req.on('close', () => {
+          cdnStreamReq.destroy();
+        });
+
+        cdnStreamReq.on('error', (err) => {
           console.error('[STREAM ERROR]', err.message);
           if (!res.headersSent) res.writeHead(502);
           res.end('502 CDN Error');
@@ -423,6 +576,10 @@ function handleRequest(req, res, postBody) {
       delete outHeaders['transfer-encoding'];
       res.writeHead(upstreamRes.statusCode, outHeaders);
       pipeline(upstreamRes, res, () => {});
+    });
+
+    req.on('close', () => {
+      upstreamReq.destroy();
     });
 
     upstreamReq.on('error', (err) => {
@@ -463,6 +620,7 @@ function handleRequest(req, res, postBody) {
     const upstreamReq = apiClient.request(`${upstreamUrl}${translatedUrl}`, {
       method: req.method,
       headers: fwdHeaders,
+      agent: getAgent(upstreamUrl),
     }, (upstreamRes) => {
       setCorsHeaders(res);
 
@@ -502,6 +660,10 @@ function handleRequest(req, res, postBody) {
       }
     });
 
+    req.on('close', () => {
+      upstreamReq.destroy();
+    });
+
     upstreamReq.on('error', (err) => {
       console.error('[API UPSTREAM ERROR]', err.message);
       if (!res.headersSent) res.writeHead(502);
@@ -536,6 +698,7 @@ function handleRequest(req, res, postBody) {
   const upstreamReq = fallbackClient.request(`${upstreamUrl}${translatedUrl}`, {
     method: req.method,
     headers: fwdHeaders,
+    agent: getAgent(upstreamUrl),
   }, (upstreamRes) => {
     // Transparently follow redirects (e.g. 302 to external CDN or S3)
     if ([301, 302, 307, 308].includes(upstreamRes.statusCode) && upstreamRes.headers.location) {
@@ -548,6 +711,7 @@ function handleRequest(req, res, postBody) {
         const redirectReq = redirectClient.request(redirectUrl.href, {
           method: req.method === 'POST' ? 'GET' : req.method,
           headers: redirectHeaders,
+          agent: getAgent(redirectUrl.href),
         }, (redirectRes) => {
           setCorsHeaders(res);
           const outHeaders = { ...redirectRes.headers };
@@ -560,6 +724,10 @@ function handleRequest(req, res, postBody) {
           console.error('[FALLBACK REDIRECT ERROR]', err.message);
           if (!res.headersSent) res.writeHead(502);
           res.end('502 Bad Gateway');
+        });
+
+        req.on('close', () => {
+          redirectReq.destroy();
         });
 
         redirectReq.end();
@@ -610,6 +778,10 @@ function handleRequest(req, res, postBody) {
     pipeline(upstreamRes, res, () => {});
   });
 
+  req.on('close', () => {
+    upstreamReq.destroy();
+  });
+
   upstreamReq.on('error', (err) => {
     console.error('[FALLBACK ERROR]', err.message);
     if (!res.headersSent) res.writeHead(502);
@@ -632,6 +804,7 @@ module.exports = {
   findProvider,
   getProviders,
   translateUrlAndBody,
+  rewriteM3u8Playlist,
   getCdnToken,
   isPrivateHost,
   getFwdUserAgent,

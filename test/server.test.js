@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const http = require('node:http');
-const { extractCredentials, translateUrlAndBody, findProvider, server } = require('../server.js');
+const { extractCredentials, translateUrlAndBody, rewriteM3u8Playlist, findProvider, server } = require('../server.js');
 
 test('extractCredentials handles all authentication mechanisms', (t) => {
   // Query params username/password
@@ -67,6 +67,26 @@ test('translateUrlAndBody rewrites credentials while preserving other parameters
   const altParsed = new URL(altResult.translatedUrl, 'http://localhost');
   assert.strictEqual(altParsed.searchParams.get('user'), 'realUpstreamUser');
   assert.strictEqual(altParsed.searchParams.get('pass'), 'realUpstreamPass');
+});
+
+test('rewriteM3u8Playlist rewrites relative, absolute and full-URL segments to HMAC signed /cdn/...', (t) => {
+  const locationUrl = new URL('http://cdn.example.com/live/play/token/12345');
+  const playlist = `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:10
+#EXTINF:10.0,
+/hls/abc/1.ts
+#EXTINF:10.0,
+http://other-cdn.example.com/hls/abc/2.ts
+#EXTINF:10.0,
+segment3.ts
+#EXT-X-KEY:METHOD=AES-128,URI="http://cdn.example.com/key.bin"`;
+
+  const rewritten = rewriteM3u8Playlist(playlist, locationUrl);
+  assert.match(rewritten, /^\/cdn\/[0-9a-f]{16}\/cdn\.example\.com\/hls\/abc\/1\.ts$/m);
+  assert.match(rewritten, /^\/cdn\/[0-9a-f]{16}\/other-cdn\.example\.com\/hls\/abc\/2\.ts$/m);
+  assert.match(rewritten, /^\/cdn\/[0-9a-f]{16}\/cdn\.example\.com\/live\/play\/token\/segment3\.ts$/m);
+  assert.match(rewritten, /URI="\/cdn\/[0-9a-f]{16}\/cdn\.example\.com\/key\.bin"/);
 });
 
 test('EPG download end-to-end integration via proxy', async (t) => {
