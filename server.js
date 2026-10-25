@@ -189,6 +189,265 @@ function rewriteM3u8Playlist(body, locationUrl) {
   return rewritten.join('\n');
 }
 
+// --- Sticky HLS Session Management & Monotonic Sequence Protection ---
+const hlsLiveSessions = new Map();
+
+function getHlsLiveSession(sessionKey) {
+  let session = hlsLiveSessions.get(sessionKey);
+  if (!session) {
+    session = {
+      edgeLocation: null,
+      locationUrl: null,
+      lastMediaSequence: -1,
+      lastRewrittenBody: null,
+      lastFetchedAt: 0,
+    };
+    hlsLiveSessions.set(sessionKey, session);
+  }
+  return session;
+}
+
+// Cleanup stale HLS sessions every 2 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, session] of hlsLiveSessions.entries()) {
+    if (now - session.lastFetchedAt > 5 * 60 * 1000) {
+      hlsLiveSessions.delete(key);
+    }
+  }
+}, 120000).unref();
+
+function parseHlsSegments(body) {
+  const lines = body.split(/\r?\n/);
+  const headerLines = [];
+  const segments = [];
+  let currentSegmentLines = [];
+  let mediaSequence = 0;
+  let inSegments = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    const seqMatch = trimmed.match(/^#EXT-X-MEDIA-SEQUENCE:(\d+)/);
+    if (seqMatch) {
+      mediaSequence = parseInt(seqMatch[1], 10);
+    }
+
+    if (trimmed.startsWith('#EXTINF:')) {
+      inSegments = true;
+      if (currentSegmentLines.length > 0) {
+        segments.push(currentSegmentLines);
+        currentSegmentLines = [];
+      }
+      currentSegmentLines.push(line);
+    } else if (inSegments) {
+      currentSegmentLines.push(line);
+      if (!trimmed.startsWith('#')) {
+        segments.push(currentSegmentLines);
+        currentSegmentLines = [];
+      }
+    } else {
+      headerLines.push(line);
+    }
+  }
+
+  if (currentSegmentLines.length > 0) {
+    segments.push(currentSegmentLines);
+  }
+
+  return { headerLines, segments, mediaSequence };
+}
+
+function normalizeHlsPlaylist(body, session) {
+  if (!body || !body.includes('#EXTM3U')) {
+    return { body, sequence: session.lastMediaSequence, useLastBody: false };
+  }
+
+  const parsed = parseHlsSegments(body);
+  let { headerLines, segments, mediaSequence } = parsed;
+
+  // Stream reset detection (e.g. upstream transcoder restarted from 0)
+  if (session.lastMediaSequence > 0 && (session.lastMediaSequence - mediaSequence > 500)) {
+    session.lastMediaSequence = mediaSequence;
+  }
+
+  // Prevent sequence regression
+  if (session.lastMediaSequence > 0 && mediaSequence < session.lastMediaSequence) {
+    const dropCount = session.lastMediaSequence - mediaSequence;
+    if (dropCount < segments.length) {
+      segments = segments.slice(dropCount);
+      mediaSequence = session.lastMediaSequence;
+    } else {
+      // Entire playlist is behind what was already served
+      if (session.lastRewrittenBody) {
+        return { body: null, sequence: session.lastMediaSequence, useLastBody: true };
+      }
+    }
+  }
+
+  // Update or insert #EXT-X-MEDIA-SEQUENCE in headers
+  let seqHeaderSet = false;
+  const newHeaderLines = headerLines.map(line => {
+    if (line.trim().startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
+      seqHeaderSet = true;
+      return `#EXT-X-MEDIA-SEQUENCE:${mediaSequence}`;
+    }
+    return line;
+  });
+
+  if (!seqHeaderSet) {
+    const m3uIdx = newHeaderLines.findIndex(l => l.trim().startsWith('#EXTM3U'));
+    if (m3uIdx !== -1) {
+      newHeaderLines.splice(m3uIdx + 1, 0, `#EXT-X-MEDIA-SEQUENCE:${mediaSequence}`);
+    } else {
+      newHeaderLines.unshift(`#EXT-X-MEDIA-SEQUENCE:${mediaSequence}`);
+    }
+  }
+
+  const rebuiltLines = [...newHeaderLines];
+  for (const segLines of segments) {
+    rebuiltLines.push(...segLines);
+  }
+
+  return {
+    body: rebuiltLines.join('\n') + '\n',
+    sequence: mediaSequence,
+    useLastBody: false,
+  };
+}
+
+function fetchHlsFromUrl(urlStr, req, callback, redirectCount = 0) {
+  if (redirectCount > 5) {
+    return callback(new Error('Too many HLS redirects'));
+  }
+  let u;
+  try {
+    u = new URL(urlStr);
+  } catch (e) {
+    return callback(e);
+  }
+
+  const client = u.protocol === 'https:' ? https : http;
+  const edgeReq = client.get(u.href, {
+    headers: {
+      'User-Agent': getFwdUserAgent(req),
+      'Accept': req.headers['accept'] || '*/*',
+    },
+    agent: getAgent(u.href),
+    timeout: 5000,
+  }, (res) => {
+    if ([301, 302, 307, 308].includes(res.statusCode) && res.headers.location) {
+      try {
+        const nextUrl = new URL(res.headers.location, u.href);
+        return fetchHlsFromUrl(nextUrl.href, req, callback, redirectCount + 1);
+      } catch (e) {
+        return callback(e);
+      }
+    }
+    const chunks = [];
+    res.on('data', c => chunks.push(c));
+    res.on('end', () => {
+      callback(null, res.statusCode, res.headers, Buffer.concat(chunks).toString('utf8'), u);
+    });
+  });
+
+  edgeReq.on('timeout', () => {
+    edgeReq.destroy(new Error('HLS fetch timeout'));
+  });
+
+  edgeReq.on('error', (err) => {
+    callback(err);
+  });
+
+  req.on('close', () => {
+    edgeReq.destroy();
+  });
+}
+
+function fetchLiveHlsPlaylist(targetStreamUrl, req, res) {
+  const session = getHlsLiveSession(targetStreamUrl);
+  const now = Date.now();
+
+  // Burst cache: if requested within 1.2s and we have a valid body, return it immediately
+  if (session.lastRewrittenBody && (now - session.lastFetchedAt < 1200)) {
+    res.writeHead(200, {
+      'Content-Type': 'application/vnd.apple.mpegurl',
+      'Content-Length': Buffer.byteLength(session.lastRewrittenBody),
+      'Access-Control-Allow-Origin': '*',
+    });
+    res.end(session.lastRewrittenBody);
+    return;
+  }
+
+  function handlePlaylistSuccess(rawBody, locationUrl) {
+    const normalized = normalizeHlsPlaylist(rawBody, session);
+    let finalBody;
+    if (normalized.useLastBody && session.lastRewrittenBody) {
+      finalBody = session.lastRewrittenBody;
+    } else {
+      finalBody = rewriteM3u8Playlist(normalized.body, locationUrl);
+      session.lastRewrittenBody = finalBody;
+      session.lastMediaSequence = Math.max(session.lastMediaSequence, normalized.sequence);
+      session.lastFetchedAt = Date.now();
+    }
+
+    if (!res.headersSent) {
+      res.writeHead(200, {
+        'Content-Type': 'application/vnd.apple.mpegurl',
+        'Content-Length': Buffer.byteLength(finalBody),
+        'Access-Control-Allow-Origin': '*',
+      });
+      res.end(finalBody);
+    }
+  }
+
+  function resolveFromUpstream() {
+    fetchHlsFromUrl(targetStreamUrl, req, (err, statusCode, headers, body, resolvedUrl) => {
+      if (err || statusCode !== 200 || !body || !body.includes('#EXTM3U')) {
+        if (session.lastRewrittenBody) {
+          console.warn(`[HLS] Upstream error (${statusCode || err?.message}) for ${targetStreamUrl}, serving fallback cached playlist`);
+          if (!res.headersSent) {
+            res.writeHead(200, {
+              'Content-Type': 'application/vnd.apple.mpegurl',
+              'Content-Length': Buffer.byteLength(session.lastRewrittenBody),
+              'Access-Control-Allow-Origin': '*',
+            });
+            res.end(session.lastRewrittenBody);
+          }
+          return;
+        }
+        if (!res.headersSent) {
+          res.writeHead(statusCode && statusCode >= 400 ? statusCode : 502);
+          res.end('502 Bad Gateway');
+        }
+        return;
+      }
+
+      session.edgeLocation = resolvedUrl.href;
+      session.locationUrl = resolvedUrl;
+      handlePlaylistSuccess(body, resolvedUrl);
+    });
+  }
+
+  // If we already have a sticky edge location, try it first
+  if (session.edgeLocation) {
+    fetchHlsFromUrl(session.edgeLocation, req, (err, statusCode, headers, body, resolvedUrl) => {
+      if (!err && statusCode === 200 && body && body.includes('#EXTM3U')) {
+        session.locationUrl = resolvedUrl;
+        handlePlaylistSuccess(body, resolvedUrl);
+      } else {
+        // Sticky edge token expired or failed (e.g. 509/403)
+        session.edgeLocation = null;
+        resolveFromUpstream();
+      }
+    });
+  } else {
+    resolveFromUpstream();
+  }
+}
+
 function getFwdUserAgent(req) {
   const ua = req.headers['user-agent'] || '';
   if (!ua || ua.includes('Python') || ua.includes('curl') || ua.includes('Wget')) {
@@ -367,7 +626,7 @@ const server = http.createServer((req, res) => {
 
 function handleRequest(req, res, postBody) {
   const reqUrl = req.url || '';
-  const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  const clientIp = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || 'unknown';
 
   // Fast 404 for non-IPTV paths (scanners, old web pages, bots)
   if (
@@ -499,6 +758,13 @@ function handleRequest(req, res, postBody) {
     }
 
     const targetStreamUrl = `${upstreamUrl}${translatedPath}`;
+
+    // HLS Live/VOD Playlist (.m3u8): sticky edge affinity and monotonic sequence protection
+    if (reqUrl.includes('.m3u8')) {
+      fetchLiveHlsPlaylist(targetStreamUrl, req, res);
+      return;
+    }
+
     const fwdHeaders = {
       'User-Agent': getFwdUserAgent(req),
       'Accept': req.headers['accept'] || '*/*',
@@ -516,31 +782,6 @@ function handleRequest(req, res, postBody) {
       if ([301, 302, 307, 308].includes(upstreamRes.statusCode) && upstreamRes.headers.location) {
         const locationUrl = new URL(upstreamRes.headers.location);
         const cdnClient = locationUrl.protocol === 'https:' ? https : http;
-
-        // HLS playlist: rewrite relative chunks to HMAC signed /cdn/<token>/<cdnHost>/...
-        if (reqUrl.includes('.m3u8')) {
-          cdnClient.get(locationUrl.href, {
-            headers: { 'User-Agent': getFwdUserAgent(req) },
-            agent: getAgent(locationUrl.href),
-          }, (cdnRes) => {
-            const chunks = [];
-            cdnRes.on('data', c => chunks.push(c));
-            cdnRes.on('end', () => {
-              const body = Buffer.concat(chunks).toString('utf8');
-              const rewritten = rewriteM3u8Playlist(body, locationUrl);
-              res.writeHead(cdnRes.statusCode, {
-                'Content-Type': cdnRes.headers['content-type'] || 'application/vnd.apple.mpegurl',
-                'Content-Length': Buffer.byteLength(rewritten),
-                'Access-Control-Allow-Origin': '*',
-              });
-              res.end(rewritten);
-            });
-          }).on('error', () => {
-            if (!res.headersSent) res.writeHead(502);
-            res.end('502 CDN Error');
-          });
-          return;
-        }
 
         // Direct MPEG-TS / MP4 binary stream
         const cdnHeaders = { 'User-Agent': getFwdUserAgent(req) };
@@ -808,4 +1049,7 @@ module.exports = {
   getCdnToken,
   isPrivateHost,
   getFwdUserAgent,
+  parseHlsSegments,
+  normalizeHlsPlaylist,
+  hlsLiveSessions,
 };

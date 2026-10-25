@@ -1,7 +1,16 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const http = require('node:http');
-const { extractCredentials, translateUrlAndBody, rewriteM3u8Playlist, findProvider, server } = require('../server.js');
+const {
+  extractCredentials,
+  translateUrlAndBody,
+  rewriteM3u8Playlist,
+  findProvider,
+  parseHlsSegments,
+  normalizeHlsPlaylist,
+  hlsLiveSessions,
+  server,
+} = require('../server.js');
 
 test('extractCredentials handles all authentication mechanisms', (t) => {
   // Query params username/password
@@ -181,6 +190,167 @@ test('EPG download end-to-end integration via proxy', async (t) => {
     assert.strictEqual(badRes.statusCode, 403);
 
   } finally {
+    mockUpstream.close();
+    server.close();
+    if (fs.existsSync(tmpProvidersPath)) fs.unlinkSync(tmpProvidersPath);
+  }
+});
+
+test('parseHlsSegments extracts header lines, segments and sequence number', (t) => {
+  const m3u8 = `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-MEDIA-SEQUENCE:500
+#EXT-X-TARGETDURATION:10
+#EXTINF:10.0,
+segment_500.ts
+#EXTINF:10.0,
+segment_501.ts`;
+
+  const parsed = parseHlsSegments(m3u8);
+  assert.strictEqual(parsed.mediaSequence, 500);
+  assert.strictEqual(parsed.segments.length, 2);
+  assert.match(parsed.segments[0][0], /#EXTINF:10\.0/);
+  assert.match(parsed.segments[0][1], /segment_500\.ts/);
+  assert.match(parsed.segments[1][1], /segment_501\.ts/);
+});
+
+test('normalizeHlsPlaylist protects against sequence regression across CDN edges', (t) => {
+  const session = {
+    lastMediaSequence: 502,
+    lastRewrittenBody: 'FALLBACK_BODY',
+  };
+
+  // Upstream edge returns regressed sequence (500 instead of 502)
+  const regressedM3u8 = `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-MEDIA-SEQUENCE:500
+#EXT-X-TARGETDURATION:10
+#EXTINF:10.0,
+segment_500.ts
+#EXTINF:10.0,
+segment_501.ts
+#EXTINF:10.0,
+segment_502.ts
+#EXTINF:10.0,
+segment_503.ts`;
+
+  const normalized = normalizeHlsPlaylist(regressedM3u8, session);
+  assert.strictEqual(normalized.sequence, 502);
+  assert.strictEqual(normalized.useLastBody, false);
+  // Segments 500 and 501 were dropped, starts at 502
+  assert.match(normalized.body, /#EXT-X-MEDIA-SEQUENCE:502/);
+  assert.ok(!normalized.body.includes('segment_500.ts'), 'segment_500 should be dropped');
+  assert.ok(!normalized.body.includes('segment_501.ts'), 'segment_501 should be dropped');
+  assert.ok(normalized.body.includes('segment_502.ts'), 'segment_502 should be present');
+  assert.ok(normalized.body.includes('segment_503.ts'), 'segment_503 should be present');
+
+  // If new edge is completely lagged behind (all segments older than 505)
+  const completelyLagged = `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-MEDIA-SEQUENCE:500
+#EXT-X-TARGETDURATION:10
+#EXTINF:10.0,
+segment_500.ts`;
+  session.lastMediaSequence = 505;
+  const laggedResult = normalizeHlsPlaylist(completelyLagged, session);
+  assert.strictEqual(laggedResult.useLastBody, true);
+});
+
+test('HLS live stream sticky edge and monotonic playback end-to-end', async (t) => {
+  let edgeRequests = 0;
+  let upstreamRequests = 0;
+  let edgePort;
+
+  // 1. Mock CDN Edge Server
+  const mockEdge = http.createServer((req, res) => {
+    edgeRequests++;
+    res.writeHead(200, { 'Content-Type': 'application/x-mpegURL' });
+    res.end(
+      '#EXTM3U\n' +
+      '#EXT-X-VERSION:3\n' +
+      '#EXT-X-MEDIA-SEQUENCE:100\n' +
+      '#EXT-X-TARGETDURATION:10\n' +
+      '#EXTINF:10.0,\n' +
+      'seg_100.ts\n' +
+      '#EXTINF:10.0,\n' +
+      'seg_101.ts\n'
+    );
+  });
+  await new Promise(r => mockEdge.listen(0, '127.0.0.1', r));
+  edgePort = mockEdge.address().port;
+
+  // 2. Mock Upstream Balancer
+  const mockUpstream = http.createServer((req, res) => {
+    upstreamRequests++;
+    res.writeHead(302, {
+      'Location': `http://127.0.0.1:${edgePort}/live/play/tok123/9999.m3u8`,
+    });
+    res.end();
+  });
+  await new Promise(r => mockUpstream.listen(0, '127.0.0.1', r));
+  const upstreamPort = mockUpstream.address().port;
+
+  // 3. Setup temporary providers config
+  const fs = require('fs');
+  const path = require('path');
+  const tmpProvidersPath = path.join(__dirname, 'tmp_hls_providers.json');
+  fs.writeFileSync(tmpProvidersPath, JSON.stringify([
+    {
+      id: 'hls-test',
+      clientUser: 'tv_user',
+      clientPass: 'tv_pass',
+      upstream: {
+        url: `http://127.0.0.1:${upstreamPort}`,
+        user: 'real_hls_user',
+        pass: 'real_hls_pass',
+      }
+    }
+  ]));
+
+  process.env.PROVIDERS_FILE = tmpProvidersPath;
+  const { getProviders } = require('../server.js');
+  getProviders();
+
+  await new Promise(r => server.listen(0, '127.0.0.1', r));
+  const proxyPort = server.address().port;
+
+  try {
+    // 4. First HLS poll: hits upstream (302) -> hits edge (200) -> establishes sticky affinity
+    const poll1 = await new Promise((resolve, reject) => {
+      http.get(`http://127.0.0.1:${proxyPort}/live/tv_user/tv_pass/9999.m3u8`, (res) => {
+        let b = '';
+        res.on('data', c => b += c);
+        res.on('end', () => resolve({ status: res.statusCode, body: b }));
+      }).on('error', reject);
+    });
+
+    assert.strictEqual(poll1.status, 200);
+    assert.match(poll1.body, /#EXT-X-MEDIA-SEQUENCE:100/);
+    assert.match(poll1.body, /\/cdn\/[0-9a-f]{16}\/127\.0\.0\.1/);
+    assert.strictEqual(upstreamRequests, 1);
+    assert.strictEqual(edgeRequests, 1);
+
+    // Wait slightly so burst cache doesn't kick in, but sticky edge is used
+    await new Promise(r => setTimeout(r, 1300));
+
+    // 5. Second HLS poll: sticky affinity should hit edge directly, skipping upstream!
+    const poll2 = await new Promise((resolve, reject) => {
+      http.get(`http://127.0.0.1:${proxyPort}/live/tv_user/tv_pass/9999.m3u8`, (res) => {
+        let b = '';
+        res.on('data', c => b += c);
+        res.on('end', () => resolve({ status: res.statusCode, body: b }));
+      }).on('error', reject);
+    });
+
+    assert.strictEqual(poll2.status, 200);
+    assert.match(poll2.body, /#EXT-X-MEDIA-SEQUENCE:100/);
+    // Crucial check: upstreamRequests must still be 1 (bypassed upstream load-balancer!)
+    assert.strictEqual(upstreamRequests, 1);
+    // Edge requests increased to 2
+    assert.strictEqual(edgeRequests, 2);
+
+  } finally {
+    mockEdge.close();
     mockUpstream.close();
     server.close();
     if (fs.existsSync(tmpProvidersPath)) fs.unlinkSync(tmpProvidersPath);
